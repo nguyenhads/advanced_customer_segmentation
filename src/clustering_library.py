@@ -13,11 +13,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+import shap
 from scipy import stats
 from scipy.stats import boxcox
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-from sklearn.metrics import silhouette_samples, silhouette_score
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, confusion_matrix, silhouette_samples, silhouette_score
 from sklearn.preprocessing import StandardScaler
 
 
@@ -431,6 +433,26 @@ class ClusterAnalyzer:
     and cluster visualization and interpretation.
     """
 
+    # Vietnamese feature names mapping
+    FEATURE_NAMES_VN = {
+        "Sum_Quantity": "Tổng số lượng mua",
+        "Mean_UnitPrice": "Giá trung bình",
+        "Mean_TotalPrice": "Giá trị giao dịch TB",
+        "Sum_TotalPrice": "Tổng chi tiêu",
+        "Count_Invoice": "Số lần mua",
+        "Count_Stock": "Số sản phẩm khác nhau",
+        "Mean_InvoiceCountPerStock": "Tần suất mua/sản phẩm",
+        "Mean_StockCountPerInvoice": "Sản phẩm/giao dịch",
+        "Mean_UnitPriceMeanPerInvoice": "Giá TB/giao dịch",
+        "Mean_QuantitySumPerInvoice": "Số lượng/giao dịch",
+        "Mean_TotalPriceMeanPerInvoice": "Giá trị TB/giao dịch",
+        "Mean_TotalPriceSumPerInvoice": "Tổng giá trị/giao dịch",
+        "Mean_UnitPriceMeanPerStock": "Giá TB/sản phẩm",
+        "Mean_QuantitySumPerStock": "Số lượng TB/sản phẩm",
+        "Mean_TotalPriceMeanPerStock": "Giá trị TB/sản phẩm",
+        "Mean_TotalPriceSumPerStock": "Tổng giá trị/sản phẩm",
+    }
+
     def __init__(self, scaled_features_path, original_features_path):
         """
         Initialize the ClusterAnalyzer with feature data paths.
@@ -447,6 +469,8 @@ class ClusterAnalyzer:
         self.pca = None
         self.optimal_clusters = {}
         self.cluster_results = {}
+        self.surrogate_models = {}
+        self.shap_results = {}
 
     def load_data(self):
         """
@@ -921,6 +945,312 @@ class ClusterAnalyzer:
         plt.suptitle(
             f"Phân tích chi tiết từng Cluster (K={k})", size=16, weight="bold", y=1.05
         )
+        plt.tight_layout()
+        plt.show()
+
+    def train_surrogate_model(self, k):
+        """
+        Train a RandomForest classifier as a surrogate model to predict cluster assignments.
+        
+        This model is used for SHAP explainability analysis.
+        
+        Args:
+            k (int): Number of clusters
+            
+        Returns:
+            dict: Training results including model and metrics
+        """
+        if k not in self.cluster_results:
+            raise ValueError(f"Cluster results for k={k} not found. Run apply_kmeans first.")
+        
+        # Get features and labels (exclude cluster columns)
+        feature_cols = [col for col in self.df_scaled.columns if not col.startswith('Cluster_')]
+        X = self.df_scaled[feature_cols].values
+        y = self.cluster_results[k]['labels']
+        
+        # Train RandomForest classifier
+        rf_model = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+        rf_model.fit(X, y)
+        
+        # Predictions
+        y_pred = rf_model.predict(X)
+        
+        # Calculate metrics
+        accuracy = accuracy_score(y, y_pred)
+        conf_matrix = confusion_matrix(y, y_pred)
+        
+        # Store results
+        self.surrogate_models[k] = {
+            'model': rf_model,
+            'accuracy': accuracy,
+            'confusion_matrix': conf_matrix,
+            'feature_names': feature_cols
+        }
+        
+        # Print results
+        print(f"=== SURROGATE MODEL TRAINING (k={k}) ===")
+        print(f"Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
+        print(f"\nConfusion Matrix:")
+        print(conf_matrix)
+        print(f"\nModel can {'ACCURATELY' if accuracy >= 0.95 else 'REASONABLY'} predict cluster assignments.")
+        
+        return self.surrogate_models[k]
+    
+    def calculate_shap_values(self, k):
+        """
+        Calculate SHAP values for cluster explanations using full dataset.
+        
+        Args:
+            k (int): Number of clusters
+            
+        Returns:
+            dict: SHAP explainer and values
+        """
+        if k not in self.surrogate_models:
+            raise ValueError(f"Surrogate model for k={k} not found. Run train_surrogate_model first.")
+        
+        # Get model and features
+        rf_model = self.surrogate_models[k]['model']
+        feature_cols = self.surrogate_models[k]['feature_names']
+        X = self.df_scaled[feature_cols].values
+        
+        # Create SHAP explainer with full dataset as background
+        print(f"Đang tính toán SHAP values cho {len(X):,} khách hàng...")
+        explainer = shap.TreeExplainer(rf_model)
+        shap_values = explainer.shap_values(X)
+        
+        # Store results
+        self.shap_results[k] = {
+            'explainer': explainer,
+            'shap_values': shap_values,
+            'feature_names': feature_cols,
+            'X': X
+        }
+        
+        print(f"✓ Hoàn thành! SHAP values shape: {np.array(shap_values).shape}")
+        return self.shap_results[k]
+    
+    def plot_shap_summary(self, k, cluster_id=None):
+        """
+        Plot SHAP summary (beeswarm plot) for cluster analysis.
+        
+        Args:
+            k (int): Number of clusters
+            cluster_id (int, optional): Specific cluster to visualize. If None, shows all.
+        """
+        if k not in self.shap_results:
+            raise ValueError(f"SHAP values for k={k} not found. Run calculate_shap_values first.")
+        
+        shap_values = self.shap_results[k]['shap_values']
+        X = self.shap_results[k]['X']
+        feature_names = self.shap_results[k]['feature_names']
+        
+        if cluster_id is not None:
+            # Plot for specific cluster
+            fig = plt.figure(figsize=(12, 8))
+            shap.summary_plot(
+                shap_values[cluster_id],
+                X,
+                feature_names=feature_names,
+                show=False
+            )
+            plt.title(f"SHAP Summary - Cluster {cluster_id} (K={k})", 
+                     fontsize=14, weight='bold', pad=20)
+            plt.tight_layout()
+            plt.show()
+        else:
+            # Plot for all clusters
+            if isinstance(shap_values, list):
+                n_clusters = len(shap_values)
+                fig, axes = plt.subplots(
+                    (n_clusters + 1) // 2, 2, 
+                    figsize=(16, 6 * ((n_clusters + 1) // 2))
+                )
+                axes = axes.flatten() if n_clusters > 1 else [axes]
+                
+                for i in range(n_clusters):
+                    plt.sca(axes[i])
+                    shap.summary_plot(
+                        shap_values[i],
+                        X,
+                        feature_names=feature_names,
+                        show=False
+                    )
+                    axes[i].set_title(f"Cluster {i}", fontsize=12, weight='bold')
+                
+                # Hide extra subplots
+                for i in range(n_clusters, len(axes)):
+                    axes[i].axis('off')
+                
+                plt.suptitle(f"SHAP Summary - All Clusters (K={k})", 
+                           fontsize=16, weight='bold', y=1.00)
+                plt.tight_layout()
+                plt.show()
+    
+    def plot_shap_bar(self, k, cluster_id=None, top_n=16):
+        """
+        Plot SHAP feature importance as bar chart.
+        
+        Args:
+            k (int): Number of clusters
+            cluster_id (int, optional): Specific cluster to visualize. If None, shows all.
+            top_n (int): Number of top features to show
+        """
+        if k not in self.shap_results:
+            raise ValueError(f"SHAP values for k={k} not found. Run calculate_shap_values first.")
+        
+        shap_values = self.shap_results[k]['shap_values']
+        feature_names = self.shap_results[k]['feature_names']
+        
+        if cluster_id is not None:
+            # Plot for specific cluster
+            fig = plt.figure(figsize=(10, 8))
+            shap.summary_plot(
+                shap_values[cluster_id],
+                feature_names=feature_names,
+                plot_type='bar',
+                max_display=top_n,
+                show=False
+            )
+            plt.title(f"SHAP Feature Importance - Cluster {cluster_id} (K={k})", 
+                     fontsize=14, weight='bold')
+            plt.xlabel("Mean |SHAP value|", fontsize=11)
+            plt.tight_layout()
+            plt.show()
+        else:
+            # Plot for all clusters
+            if isinstance(shap_values, list):
+                n_clusters = len(shap_values)
+                fig, axes = plt.subplots(
+                    (n_clusters + 1) // 2, 2,
+                    figsize=(14, 5 * ((n_clusters + 1) // 2))
+                )
+                axes = axes.flatten() if n_clusters > 1 else [axes]
+                
+                for i in range(n_clusters):
+                    plt.sca(axes[i])
+                    shap.summary_plot(
+                        shap_values[i],
+                        feature_names=feature_names,
+                        plot_type='bar',
+                        max_display=top_n,
+                        show=False
+                    )
+                    axes[i].set_title(f"Cluster {i}", fontsize=12, weight='bold')
+                    axes[i].set_xlabel("Mean |SHAP value|", fontsize=10)
+                
+                # Hide extra subplots
+                for i in range(n_clusters, len(axes)):
+                    axes[i].axis('off')
+                
+                plt.suptitle(f"SHAP Feature Importance - All Clusters (K={k})", 
+                           fontsize=16, weight='bold')
+                plt.tight_layout()
+                plt.show()
+    
+    def plot_shap_waterfall(self, k, customer_id, cluster_id=None):
+        """
+        Plot SHAP waterfall chart for individual customer explanation.
+        
+        Args:
+            k (int): Number of clusters
+            customer_id (str): Customer ID to explain
+            cluster_id (int, optional): Which cluster prediction to explain
+        """
+        if k not in self.shap_results:
+            raise ValueError(f"SHAP values for k={k} not found. Run calculate_shap_values first.")
+        
+        # Find customer index
+        try:
+            customer_idx = self.df_scaled.index.get_loc(customer_id)
+        except KeyError:
+            raise ValueError(f"Customer ID '{customer_id}' not found in dataset.")
+        
+        shap_values = self.shap_results[k]['shap_values']
+        X = self.shap_results[k]['X']
+        feature_names = self.shap_results[k]['feature_names']
+        explainer = self.shap_results[k]['explainer']
+        
+        # Get actual cluster assignment
+        actual_cluster = self.cluster_results[k]['labels'][customer_idx]
+        
+        # Determine which cluster to explain
+        if cluster_id is None:
+            cluster_id = actual_cluster
+        
+        # Create explanation object
+        if isinstance(shap_values, list):
+            shap_vals = shap_values[cluster_id][customer_idx]
+        else:
+            shap_vals = shap_values[customer_idx]
+        
+        explanation = shap.Explanation(
+            values=shap_vals,
+            base_values=explainer.expected_value[cluster_id] if isinstance(explainer.expected_value, (list, np.ndarray)) else explainer.expected_value,
+            data=X[customer_idx],
+            feature_names=feature_names
+        )
+        
+        # Plot waterfall
+        fig = plt.figure(figsize=(10, 8))
+        shap.waterfall_plot(explanation, show=False)
+        plt.title(f"SHAP Explanation for Customer {customer_id} - Cluster {cluster_id}\n(Actual Cluster: {actual_cluster})", 
+                 fontsize=13, weight='bold', pad=20)
+        plt.tight_layout()
+        plt.show()
+    
+    def plot_shap_decision(self, k, customer_ids, cluster_id=0):
+        """
+        Plot SHAP decision plot comparing multiple customers.
+        
+        Args:
+            k (int): Number of clusters
+            customer_ids (list): List of customer IDs to compare
+            cluster_id (int): Which cluster prediction to visualize
+        """
+        if k not in self.shap_results:
+            raise ValueError(f"SHAP values for k={k} not found. Run calculate_shap_values first.")
+        
+        # Find customer indices
+        customer_indices = []
+        valid_ids = []
+        for cid in customer_ids:
+            try:
+                idx = self.df_scaled.index.get_loc(cid)
+                customer_indices.append(idx)
+                valid_ids.append(cid)
+            except KeyError:
+                print(f"Warning: Customer ID '{cid}' not found, skipping.")
+        
+        if not customer_indices:
+            raise ValueError("No valid customer IDs found.")
+        
+        shap_values = self.shap_results[k]['shap_values']
+        X = self.shap_results[k]['X']
+        feature_names = self.shap_results[k]['feature_names']
+        explainer = self.shap_results[k]['explainer']
+        
+        # Get SHAP values for selected customers
+        if isinstance(shap_values, list):
+            selected_shap = shap_values[cluster_id][customer_indices]
+            expected_value = explainer.expected_value[cluster_id]
+        else:
+            selected_shap = shap_values[customer_indices]
+            expected_value = explainer.expected_value
+        
+        # Plot decision plot
+        fig = plt.figure(figsize=(10, 10))
+        shap.decision_plot(
+            expected_value,
+            selected_shap,
+            X[customer_indices],
+            feature_names=feature_names,
+            legend_labels=valid_ids,
+            legend_location='lower right',
+            show=False
+        )
+        plt.title(f"SHAP Decision Plot - Customer Comparison (Cluster {cluster_id}, K={k})", 
+                 fontsize=13, weight='bold', pad=20)
         plt.tight_layout()
         plt.show()
 
