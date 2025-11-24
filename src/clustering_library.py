@@ -1015,9 +1015,18 @@ class ClusterAnalyzer:
         X = self.df_scaled[feature_cols].values
         
         # Create SHAP explainer with full dataset as background
-        print(f"Đang tính toán SHAP values cho {len(X):,} khách hàng...")
+        print(f"Tính toán SHAP values cho {len(X):,} khách hàng...")
         explainer = shap.TreeExplainer(rf_model)
-        shap_values = explainer.shap_values(X)
+        shap_values_raw = explainer.shap_values(X)
+        
+        # Convert to list format for multi-class
+        # Shape: (n_samples, n_features, n_classes) -> list of (n_samples, n_features)
+        if isinstance(shap_values_raw, np.ndarray) and len(shap_values_raw.shape) == 3:
+            # Multi-class: transpose to get (n_classes, n_samples, n_features)
+            shap_values = [shap_values_raw[:, :, i] for i in range(shap_values_raw.shape[2])]
+        else:
+            # Already in list format or binary classification
+            shap_values = shap_values_raw
         
         # Store results
         self.shap_results[k] = {
@@ -1027,7 +1036,7 @@ class ClusterAnalyzer:
             'X': X
         }
         
-        print(f"✓ Hoàn thành! SHAP values shape: {np.array(shap_values).shape}")
+        print(f"Hoàn thành! SHAP values: {len(shap_values)} clusters, mỗi cluster shape: {shap_values[0].shape}")
         return self.shap_results[k]
     
     def plot_shap_summary(self, k, cluster_id=None):
@@ -1044,48 +1053,16 @@ class ClusterAnalyzer:
         shap_values = self.shap_results[k]['shap_values']
         X = self.shap_results[k]['X']
         feature_names = self.shap_results[k]['feature_names']
-        
-        if cluster_id is not None:
-            # Plot for specific cluster
-            fig = plt.figure(figsize=(12, 8))
+    
+        for i in range(k):
             shap.summary_plot(
-                shap_values[cluster_id],
+                shap_values[i],
                 X,
                 feature_names=feature_names,
-                show=False
+                max_display=3,
+                show=True
             )
-            plt.title(f"SHAP Summary - Cluster {cluster_id} (K={k})", 
-                     fontsize=14, weight='bold', pad=20)
-            plt.tight_layout()
-            plt.show()
-        else:
-            # Plot for all clusters
-            if isinstance(shap_values, list):
-                n_clusters = len(shap_values)
-                fig, axes = plt.subplots(
-                    (n_clusters + 1) // 2, 2, 
-                    figsize=(16, 6 * ((n_clusters + 1) // 2))
-                )
-                axes = axes.flatten() if n_clusters > 1 else [axes]
-                
-                for i in range(n_clusters):
-                    plt.sca(axes[i])
-                    shap.summary_plot(
-                        shap_values[i],
-                        X,
-                        feature_names=feature_names,
-                        show=False
-                    )
-                    axes[i].set_title(f"Cluster {i}", fontsize=12, weight='bold')
-                
-                # Hide extra subplots
-                for i in range(n_clusters, len(axes)):
-                    axes[i].axis('off')
-                
-                plt.suptitle(f"SHAP Summary - All Clusters (K={k})", 
-                           fontsize=16, weight='bold', y=1.00)
-                plt.tight_layout()
-                plt.show()
+    
     
     def plot_shap_bar(self, k, cluster_id=None, top_n=16):
         """
@@ -1110,7 +1087,7 @@ class ClusterAnalyzer:
                 feature_names=feature_names,
                 plot_type='bar',
                 max_display=top_n,
-                show=False
+                show=True
             )
             plt.title(f"SHAP Feature Importance - Cluster {cluster_id} (K={k})", 
                      fontsize=14, weight='bold')
