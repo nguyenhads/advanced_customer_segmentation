@@ -13,11 +13,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+import shap
 from scipy import stats
 from scipy.stats import boxcox
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-from sklearn.metrics import silhouette_samples, silhouette_score
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, confusion_matrix, silhouette_samples, silhouette_score
 from sklearn.preprocessing import StandardScaler
 
 
@@ -431,6 +433,26 @@ class ClusterAnalyzer:
     and cluster visualization and interpretation.
     """
 
+    # Vietnamese feature names mapping
+    FEATURE_NAMES_VN = {
+        "Sum_Quantity": "Tổng số lượng mua",
+        "Mean_UnitPrice": "Giá trung bình",
+        "Mean_TotalPrice": "Giá trị giao dịch TB",
+        "Sum_TotalPrice": "Tổng chi tiêu",
+        "Count_Invoice": "Số lần mua",
+        "Count_Stock": "Số sản phẩm khác nhau",
+        "Mean_InvoiceCountPerStock": "Tần suất mua/sản phẩm",
+        "Mean_StockCountPerInvoice": "Sản phẩm/giao dịch",
+        "Mean_UnitPriceMeanPerInvoice": "Giá TB/giao dịch",
+        "Mean_QuantitySumPerInvoice": "Số lượng/giao dịch",
+        "Mean_TotalPriceMeanPerInvoice": "Giá trị TB/giao dịch",
+        "Mean_TotalPriceSumPerInvoice": "Tổng giá trị/giao dịch",
+        "Mean_UnitPriceMeanPerStock": "Giá TB/sản phẩm",
+        "Mean_QuantitySumPerStock": "Số lượng TB/sản phẩm",
+        "Mean_TotalPriceMeanPerStock": "Giá trị TB/sản phẩm",
+        "Mean_TotalPriceSumPerStock": "Tổng giá trị/sản phẩm",
+    }
+
     def __init__(self, scaled_features_path, original_features_path):
         """
         Initialize the ClusterAnalyzer with feature data paths.
@@ -447,6 +469,8 @@ class ClusterAnalyzer:
         self.pca = None
         self.optimal_clusters = {}
         self.cluster_results = {}
+        self.surrogate_models = {}
+        self.shap_results = {}
 
     def load_data(self):
         """
@@ -923,6 +947,121 @@ class ClusterAnalyzer:
         )
         plt.tight_layout()
         plt.show()
+
+    def train_surrogate_model(self, k):
+        """
+        Huấn luyện mô hình RandomForest classifier để có thể mô phỏng thuật toán KMeans.
+        Mô hình này sẽ được dùng cho phân tích lời giải thích của SHAP.
+        
+        Args:
+            k (int): Number of clusters
+            
+        Returns:
+            dict: Training results including model and metrics
+        """
+        if k not in self.cluster_results:
+            raise ValueError(f"Cluster results for k={k} not found. Run apply_kmeans first.")
+        
+        # Lấy tất cả cột không phải là Cluster_
+        feature_cols = [col for col in self.df_scaled.columns if not col.startswith('Cluster_')]
+        X = self.df_scaled[feature_cols].values
+        y = self.cluster_results[k]['labels']
+        
+        # Huấn luyện mô hình RandomForest classifier
+        rf_model = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+        rf_model.fit(X, y)
+        
+        # Dự đoán
+        y_pred = rf_model.predict(X)
+        
+        # Tính toán các chỉ số
+        accuracy = accuracy_score(y, y_pred)
+        conf_matrix = confusion_matrix(y, y_pred)
+        
+        # Lưu kết quả
+        self.surrogate_models[k] = {
+            'model': rf_model,
+            'accuracy': accuracy,
+            'confusion_matrix': conf_matrix,
+            'feature_names': feature_cols
+        }
+        
+        # In báo kết quả
+        print(f"=== HUẤN LUYỆN MÔ HÌNH THAY THẾ (k={k}) ===")
+        print(f"Độ chính xác: {accuracy:.4f} ({accuracy*100:.2f}%)")
+        print(f"\nConfusion Matrix:")
+        print(conf_matrix)
+        print(f"\nMô hình có thể dự đoán {'CHÍNH XÁC' if accuracy >= 0.95 else 'HỢP LÝ'} các phân cụm.")
+        
+        return self.surrogate_models[k]
+    
+    def calculate_shap_values(self, k):
+        """
+        Tính toán SHAP values cho lời giải thích kết quả phân cụm sử dụng toàn bộ dữ liệu.
+        
+        Args:
+            k (int): Number of clusters
+            
+        Returns:
+            dict: SHAP explainer and values
+        """
+        if k not in self.surrogate_models:
+            raise ValueError(f"Mô hình thay thế cho k={k} không tìm thấy. Vui lòng chạy train_surrogate_model trước.")
+        
+        # Lấy mô hình và các đặc trưng
+        rf_model = self.surrogate_models[k]['model']
+        feature_cols = self.surrogate_models[k]['feature_names']
+        X = self.df_scaled[feature_cols].values
+        
+        # Tạo SHAP explainer với toàn bộ dữ liệu làm nền (background)
+        # Khi dữ liệu làm nền càng lớn thì thuật toán SHAP càng chính xác
+        print(f"Tính toán SHAP values cho {len(X):,} khách hàng...")
+        explainer = shap.TreeExplainer(rf_model)
+        shap_values_raw = explainer.shap_values(X)
+        
+        # Chuyển đổi sang định dạng list cho trường hợp đa lớp
+        # Shape: (n_samples, n_features, n_classes) -> list (n_samples, n_features)
+        if isinstance(shap_values_raw, np.ndarray) and len(shap_values_raw.shape) == 3:
+            # TH đa lớp: chuyển vị để có (n_classes, n_samples, n_features)
+            shap_values = [shap_values_raw[:, :, i] for i in range(shap_values_raw.shape[2])]
+        else:
+            # TH nhị phân: Đã ở định dạng list hoặc phân loại nhị phân
+            shap_values = shap_values_raw
+        
+        # Lưu kết quả
+        self.shap_results[k] = {
+            'explainer': explainer,
+            'shap_values': shap_values,
+            'feature_names': feature_cols,
+            'X': X
+        }
+        
+        print(f"Hoàn thành! SHAP values: {len(shap_values)} clusters, mỗi cluster shape: {shap_values[0].shape}")
+        return self.shap_results[k]
+    
+    def plot_shap_summary(self, k, cluster_id=None):
+        """
+        Vẽ biểu đồ tóm tắt SHAP (beeswarm plot) cho phân tích cụm.
+        
+        Args:
+            k (int): Number of clusters
+            cluster_id (int, optional): Specific cluster to visualize. If None, shows all.
+        """
+        if k not in self.shap_results:
+            raise ValueError(f"Giá trị SHAP cho k={k} không tìm thấy. Vui lòng chạy calculate_shap_values trước.")
+        
+        shap_values = self.shap_results[k]['shap_values']
+        X = self.shap_results[k]['X']
+        feature_names = self.shap_results[k]['feature_names']
+    
+        for i in range(k):
+            shap.summary_plot(
+                shap_values[i],
+                X,
+                feature_names=feature_names,
+                max_display=3,
+                show=True
+            )
 
     def save_clusters(self, output_dir="../data/processed"):
         """
